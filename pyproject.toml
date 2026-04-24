@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-literature-rag"
+version = "0.1.0"
+description = "A reusable local agentic RAG system for literature Markdown corpora."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.2.0",
+  "openai>=2.31.0",
+  "pydantic>=2.12.0",
+  "typer>=0.24.0",
+  "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=9.0.0"]
+
+[project.scripts]
+literature-rag = "agentic_rag.cli:app"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

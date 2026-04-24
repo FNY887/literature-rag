@@ -1,0 +1,22 @@
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Local vector stores and user corpora
+.rag_store/
+literature_md/
+
+# Python caches and packaging outputs
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*$py.class
+src/*.egg-info/
+build/
+dist/
+*.spec
+
+# Local agent/editor state
+.claude/
+.codex

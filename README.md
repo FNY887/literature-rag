@@ -1,217 +1,413 @@
 # Agentic Literature RAG
 
-`agentic-literature-rag` is a local agentic RAG package for Markdown literature
-corpora. It splits the workflow into two independent modules:
+`agentic-literature-rag` 是一个面向 Markdown 科学文献语料的本地 agentic RAG 系统。它把离线建库和在线问答拆成两个独立链路：
 
-1. **Builder** (`agentic_rag.builder`): chunk Markdown files, generate embeddings,
-   persist a hybrid index (SQLite + FTS5 + vectors), and export cleaned/chunked artifacts for inspection under `.rag_store/chunks/`.
-2. **Query** (`agentic_rag.query`): analyze questions, run hybrid retrieval,
-   either grade evidence per paper for literature search or synthesize a chunk-grounded research report.
+1. `agentic_rag.builder`：清洗 Markdown 文献、提取标题和章节、语义切块、调用 DashScope embedding，并把 SQLite + FTS5 + 向量索引写入本地。
+2. `agentic_rag.query`：分析用户问题、执行混合召回、调用 rerank，并根据选择的模式输出文献级证据回答或深度研究报告。
 
-The design is not "one-shot vector retrieval then generate". Instead, an agent
-plans retrieval, scores **all** chunks without truncation, aggregates documents
-by the average of their top-3 chunk scores, re-ranks the top 300 documents,
-judges evidence per paper on the top 100, and stops early when no more
-direct-support papers are found.
+这个项目不是“一次向量检索后直接生成答案”。默认文献检索路线会让 agent 先规划检索，再对所有 chunks 做 hybrid recall，按文献聚合、重排、逐篇 judge，最后只基于有直接证据的文献生成可引用回答。
 
-The optional deep research route keeps the same retrieval planner, re-ranks the
-top 500 chunks, sends up to 100 complete chunks within a context budget, and
-asks the chat model to write a cited research report of at least 500 characters, with no fixed upper limit.
+## 功能概览
 
-## Installation
+- 本地 Markdown 文献库构建：递归读取 `.md` 文件，生成本地 SQLite 向量库。
+- 增量添加文献：已入库且文件 hash 未变的文献会跳过，预览缺失时会从 SQLite 补写 chunk 预览。
+- 文献删除：可按论文标题或原始 Markdown 文件名从库里删除。
+- 文献检索模式：召回、rerank、逐篇 judge，并输出每篇支持文献的回答行和参考文献。
+- 深度研究模式：召回后做 chunk 级 rerank，取最多 100 个完整 chunks，让聊天模型生成带引用的研究报告。
+- 可替换聊天模型：通用聊天模型使用 OpenAI-compatible Chat Completions API，通过 `CHAT_*` 环境变量配置。
+
+## 安装
+
+推荐在项目根目录执行：
 
 ```bash
 pip install -e .
 ```
 
-Requires Python >=3.11.
-
-## Configuration
-
-All API keys and tunables are read from environment variables.
-
-### Embeddings & Rerank
-
-- `DASHSCOPE_API_KEY`: required for real embedding generation and reranking
-- `DASHSCOPE_BASE_URL`: defaults to `https://dashscope.aliyuncs.com/compatible-mode/v1`
-- `EMBEDDING_MODEL`: defaults to `text-embedding-v4`
-- `EMBEDDING_DIMENSIONS`: defaults to `2048`
-- `RERANK_MODEL`: defaults to `qwen3-rerank`
-- `RERANK_DOCUMENT_CHUNK_LIMIT`: defaults to `3`
-- `RERANK_DOCUMENT_TEXT_LIMIT`: defaults to `0` (no truncation)
-- `RERANK_REQUEST_TOKEN_BUDGET`: defaults to `3600` for batched rerank requests
-
-### Agent reasoning
-
-- `CHAT_API_KEY`: required for OpenAI-compatible ask agent reasoning
-- `CHAT_BASE_URL`: defaults to `https://api.deepseek.com`
-- `CHAT_MODEL`: defaults to `deepseek-chat`
-- Common compatible endpoints:
-  - DeepSeek: `CHAT_BASE_URL=https://api.deepseek.com`
-  - DashScope compatible mode: `CHAT_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1`
-  - OpenAI: `CHAT_BASE_URL=https://api.openai.com/v1`
-
-### Chunking & retrieval
-
-- `CHUNK_SIZE`: defaults to `2200`
-- `CHUNK_OVERLAP`: defaults to `100`
-- Chunk artifacts are exported by default to `.rag_store/chunks`
-- `TOP_K_VECTOR`: defaults to `30`
-- `TOP_K_KEYWORD`: defaults to `30`
-- `DOCUMENT_RECALL_LIMIT`: defaults to `300`
-- `DOCUMENT_JUDGE_LIMIT`: defaults to `100`
-- `DOCUMENT_JUDGE_INITIAL_CONCURRENCY`: defaults to `5`; provider pressure retries already-dispatched documents with lower concurrency
-- `RESEARCH_RERANK_CHUNK_LIMIT`: defaults to `500`
-- `RESEARCH_FINAL_CHUNK_LIMIT`: defaults to `100`
-- `RESEARCH_CONTEXT_TOKEN_BUDGET`: defaults to `120000`
-- `RESEARCH_REPORT_MIN_CHARS`: defaults to `500`; Python character count, so one Chinese character counts as one
-
-## CLI
+如果使用当前开发环境，可以显式指定 conda 环境里的 pip：
 
 ```bash
-# Rebuild the vector database from a directory of Markdown files
-literature-rag build ./papers
-
-# Add new papers incrementally from a directory
-literature-rag add ./new_papers
-
-# Interactive mode selection: literature search or deep research
-literature-rag
-
-# Show command help
-literature-rag --help
+/home/fanny/miniconda3/envs/literature_rag/bin/pip install -e .
 ```
 
-Default behavior:
+要求 Python `>=3.11`。
 
-- `literature-rag build <dir>` clears the current vector database and rebuilds it from the Markdown files under `<dir>`.
-- `literature-rag add <dir>` keeps the existing vector database and adds new Markdown papers from `<dir>`.
-- `literature-rag` loads the default database path `.rag_store/literature_rag.sqlite3`, then shows an up/down-key menu for `文献检索` or `深度研究`.
-- `literature-rag --help` shows the available commands and usage.
+安装后会得到命令行入口：
 
-Literature search mode prompts for a question, runs the document-level agentic pipeline, and outputs:
-1. Numbered answer lines (one per paper)
-2. Numbered reference list (multi-chunk papers list all supporting chunks)
-3. Scan status summary
+```bash
+literature-rag
+```
 
-Deep research mode prompts for a research question, runs chunk-level rerank, and outputs:
-1. A research report of at least `RESEARCH_REPORT_MIN_CHARS`, with length decided by the chat model from the provided chunks
-2. A reference list for cited chunks
-3. Recall/rerank/context chunk counts and timing summary
+## 配置
+
+复制示例配置：
+
+```bash
+cp .env.example .env
+```
+
+然后在 `.env` 中填写自己的 key。不要把 `.env` 提交到 Git。
+
+### 必填 key
+
+```bash
+DASHSCOPE_API_KEY=
+CHAT_API_KEY=
+```
+
+`DASHSCOPE_API_KEY` 用于 embedding 和 rerank。`CHAT_API_KEY` 用于 agent 分析、文献 judge 和深度研究报告生成。
+
+### Embedding 与 rerank
+
+```bash
+DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+DASHSCOPE_RERANK_BASE_URL=https://dashscope.aliyuncs.com/compatible-api/v1
+EMBEDDING_MODEL=text-embedding-v4
+EMBEDDING_DIMENSIONS=2048
+RERANK_MODEL=qwen3-rerank
+RERANK_REQUEST_TOKEN_BUDGET=3600
+```
+
+默认 embedding 模型是 `text-embedding-v4`，维度是 `2048`。默认 rerank 模型是 `qwen3-rerank`。程序会按 token budget 分批请求 rerank；rerank 失败不会静默回退成本地排序，而是直接报错。
+
+### 通用聊天模型
+
+```bash
+CHAT_BASE_URL=https://api.deepseek.com
+CHAT_MODEL=deepseek-chat
+CHAT_TIMEOUT_SECONDS=300
+CHAT_MAX_RETRIES=4
+```
+
+聊天模型走 OpenAI-compatible API，因此可以换成不同服务：
+
+```bash
+# DeepSeek
+CHAT_BASE_URL=https://api.deepseek.com
+CHAT_MODEL=deepseek-chat
+
+# DashScope OpenAI 兼容模式
+CHAT_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+CHAT_MODEL=qwen-plus
+
+# OpenAI
+CHAT_BASE_URL=https://api.openai.com/v1
+CHAT_MODEL=gpt-4.1-mini
+```
+
+### 切块与检索默认值
+
+```bash
+CHUNK_SIZE=2200
+CHUNK_OVERLAP=100
+TOP_K_VECTOR=30
+TOP_K_KEYWORD=30
+DOCUMENT_RECALL_LIMIT=300
+DOCUMENT_JUDGE_LIMIT=100
+DOCUMENT_JUDGE_INITIAL_CONCURRENCY=5
+RERANK_DOCUMENT_CHUNK_LIMIT=3
+RERANK_DOCUMENT_TEXT_LIMIT=0
+RESEARCH_RERANK_CHUNK_LIMIT=500
+RESEARCH_FINAL_CHUNK_LIMIT=100
+RESEARCH_CONTEXT_TOKEN_BUDGET=120000
+RESEARCH_REPORT_MIN_CHARS=500
+```
+
+说明：
+
+- `RERANK_DOCUMENT_TEXT_LIMIT=0` 表示文献级 rerank 不截断 chunk 文本。
+- 文献检索路线每篇文献固定取 top-3 chunks 进入 rerank 和 judge。
+- 深度研究路线默认对前 500 个 chunks 做 rerank，最多把 100 个完整 chunks 放入最终生成上下文。
+- `RESEARCH_REPORT_MIN_CHARS=500` 按 Python 字符数计算，中文一个汉字算 1 个字符；报告没有固定上限，由聊天模型根据 chunks 内容决定长度。
+
+## CLI 用法
+
+### 重建向量库
+
+```bash
+literature-rag build ./papers
+```
+
+`build` 会清空旧索引，并用指定目录下的 Markdown 文献重新建库。
+
+### 增量添加文献
+
+```bash
+literature-rag add ./new_papers
+```
+
+`add` 会递归扫描目录或添加单个 Markdown 文件。成功入库的文献会同步写入 `.rag_store/chunks/` 下的 chunk 预览文件。
+
+### 删除文献
+
+```bash
+literature-rag delete --title "论文标题或md文件名"
+```
+
+删除操作会从 SQLite 索引中移除对应文献及其 chunks。
+
+### 交互式查询
+
+```bash
+literature-rag
+```
+
+启动后程序会先加载默认向量库：
+
+```text
+.rag_store/literature_rag.sqlite3
+```
+
+然后显示上下键菜单：
+
+```text
+文献检索
+深度研究
+```
+
+选择 `文献检索` 后，输入问题，程序会输出：
+
+1. 编号回答，每条通常对应一篇 direct_support 文献。
+2. 参考文献列表，同一文献多个 supporting chunks 会合并显示。
+3. 扫描状态、judge 数量、并发和耗时统计。
+
+选择 `深度研究` 后，输入研究问题，程序会输出：
+
+1. 基于 evidence chunks 生成的研究报告。
+2. 报告中实际引用到的参考文献。
+3. recalled / reranked / context chunk 数量和耗时统计。
+
+### 指定索引路径
+
+```bash
+literature-rag --index-path .rag_store/literature_rag.sqlite3
+```
+
+`build`、`add`、`delete` 也都支持 `--index-path`。
 
 ## Python API
 
-### Builder
+### 建库与增量添加
 
 ```python
-from agentic_rag.builder import build_index, add_documents
+from agentic_rag.builder import add_documents, build_index, delete_document
 
-# Build from a directory
 build_index(
-    source_dir="literature",
+    source_dir="literature_md",
     index_path=".rag_store/literature_rag.sqlite3",
 )
 
-# Add more papers later
 add_documents(
-    paths=["new_paper1.md", "new_paper2.md"],
+    paths=["new_papers"],
+    index_path=".rag_store/literature_rag.sqlite3",
+)
+
+delete_document(
+    title="Paper Title",
     index_path=".rag_store/literature_rag.sqlite3",
 )
 ```
 
-### Query
+### 搜索、文献检索和深度研究
 
 ```python
 import asyncio
 
 from agentic_rag.query import answer, answer_stream, research, search
 
-# Search
 hits = search(
-    query="prenucleation cluster mediated calcium phosphate nucleation",
+    query="hydroxyapatite molecular dynamics DFT",
     mode="hybrid",
     top_k=5,
 )
 
 async def main():
     result = await answer(
-        question="What evidence links prenucleation clusters to collagen mineralization?",
+        question="使用分子动力学模拟和DFT分别研究羟基磷灰石，两者的异同在哪？",
     )
     print(result.answer)
     print(result.citations)
 
     async for event in answer_stream(
-        question="What evidence links prenucleation clusters to collagen mineralization?",
+        question="早期矿化发生在胶原纤维内的文献内容",
     ):
         print(event.event)
 
-asyncio.run(main())
-
-# Deep research report
-report = asyncio.run(
-    research(
-        question="summarize evidence for collagen intrafibrillar mineralization",
+    report = await research(
+        question="羟基磷灰石在医学领域有哪些应用？",
     )
-)
-print(report.report)
+    print(report.report)
+    print(report.citations)
+
+asyncio.run(main())
 ```
 
-## Architecture
+Python API 支持注入自定义后端：
 
-```
-agentic_rag/
-├── builder/          # Offline indexing
-│   ├── chunker.py    # Markdown → semantic chunks
-│   ├── embedder.py   # Embedding client (DashScope)
-│   └── store.py      # SQLite + FTS5 + vectors
-├── query/            # Online retrieval
-│   ├── retriever.py  # Hybrid search (vector + keyword + RRF)
-│   ├── reranker.py   # Document reranker (DashScope)
-│   └── agent.py      # Evidence judge + deterministic answer assembly
-├── core/             # Shared
-│   ├── models.py     # Pydantic data models
-│   ├── config.py     # Settings
-│   ├── llm.py        # OpenAI-compatible chat LLM client
-│   └── utils.py      # Retry, dedupe, JSON extraction
-└── cli.py            # Typer CLI
-```
+- `embedder=`：实现 `embed_texts()` 和 `embed_query()`
+- `reranker=`：实现 `rerank()`
+- `llm=`：实现 `await complete_json()`
 
-### Pluggable backends
+## 输入 Markdown 格式
 
-The package defines three `Protocol` classes for swapping backends:
-
-- `Embedder`: `embed_texts()` / `embed_query()`
-- `Reranker`: `rerank()`
-- `LLMClient`: `await complete_json()`
-
-Inject your own implementations via the `embedder=`, `reranker=`, and `llm=`
-keyword arguments in the Python API.
-
-## Input format
-
-Each literature file should be a plain Markdown (`.md`) file:
+每篇文献应该是一个 `.md` 文件，并且必须有真实论文标题 H1：
 
 ```markdown
 # Paper Title
 
-## Abstract
-The abstract text goes here...
+Author names...
 
-## Introduction
-Introduction paragraphs...
+# ABSTRACT
 
-## Methods
-Methods paragraphs...
+Abstract text...
+
+# INTRODUCTION
+
+Introduction text...
+
+## 2. Experimental section
+
+### 2.1. Sample preparation
+
+Body text...
 ```
 
-The chunker is tuned for standard English journal-paper Markdown:
+标题约束：
 
-- It uses the first `# ` heading as the document title and keeps formal section headings as `section_hint`.
-- It removes front matter such as authors, affiliations, `ARTICLE INFO`, `Keywords`, received/accepted metadata, image Markdown, and everything after `References` / `Bibliography` / similar tail sections.
-- It preserves `Abstract`, `Statement of significance` / `Highlights`, body paragraphs, and figure captions.
-- It builds section-anchored semantic chunks: the first chunk is `Title + Abstract`, and body chunks start from `section heading + first paragraph`, merging short follow-on paragraphs when needed.
+- 论文标题必须来自 Markdown H1，也就是 `# Paper Title`。
+- 不使用文件名兜底生成论文标题。
+- `Just Accepted`、`Accepted Article`、`Article`、`Reuse`、`Takedown`、期刊 masthead、推荐文章、广告 OCR 等 front matter 不会作为论文标题。
+- 如果同一个真实论文标题 H1 重复出现，默认选择最后一次作为正文起点，并丢弃它之前的网页头部噪声。
+- 如果存在多个不同的真实论文标题候选，程序会报错并跳过该文件，避免把多篇文章混入同一条文献。
 
-After build/add runs, the cleaned and chunked result of each paper is also written to `.rag_store/chunks/`:
+## 清洗与切块规则
 
-- `<doc_id>.chunks.json` — structured chunk metadata and text
-- `<doc_id>.chunks.md` — human-readable chunk preview for manual inspection
+核心实现位于 `src/agentic_rag/builder/chunker.py`。
+
+主要规则：
+
+- 删除网页头部、期刊 banner、accepted manuscript 声明、作者单位、邮箱、`ARTICLE INFO`、`Keywords`、received/accepted/published metadata、图片 Markdown 本体、`References` 及其后的参考文献。
+- 保留摘要、正文段落、`Statement of significance`、`Highlights` 和 figure caption。
+- 表格行和表格本体会在清洗时去掉，保留 caption；目标是让 chunk 内容尽量是自然语言句子。
+- 不允许为了处理超长输入而随意切断句子；切分应优先按句子边界进行。
+- 支持层级标题路径：`##`、`###`、`####` 等父子标题会被保留到 chunk 文本和 `section_hint` 中。
+- 如果短 section 合并到同一个 chunk，每个 section 都会重新写入自己的完整标题路径，保证 chunk 独立可读。
+- 如果长 section 被拆成多个 chunk，后续 chunk 也会重复携带完整标题路径。
+
+建库或增量添加成功后，程序会额外写出人工检查用预览：
+
+```text
+.rag_store/chunks/<doc_id>.chunks.json
+.rag_store/chunks/<doc_id>.chunks.md
+```
+
+注意：`.rag_store/chunks/` 只是预览文件，不参与检索。真正的查询源是 SQLite。
+
+## 检索路线
+
+### 文献检索
+
+默认文献检索链路：
+
+1. 聊天模型分析问题，生成 query bundles 和约束。
+2. 对所有 chunks 执行 hybrid recall，不在 agent 模式下截断召回结果。
+3. 对每个 query bundle 的命中结果做约束感知重评分。
+4. 按 `doc_id` 聚合，每篇文献取最高分 top-3 chunks。
+5. 按 top-3 chunk 平均分取前 300 篇文献。
+6. 用 `qwen3-rerank` 对 300 篇文献级候选重排。
+7. 取前 100 篇进入文献级 judge。
+8. 每篇 judge 只看该文献 top-3 chunks，判断是否 direct_support。
+9. 支持文献生成 2-3 句文献级 answer line。
+10. 最终按排序顺序拼接答案并生成引用。
+
+提前停止规则：如果连续 20 篇已提交文献都没有新增 direct_support，则停止派发新文献；已经派发的请求会完成并计入最终结果。
+
+### 深度研究
+
+深度研究链路：
+
+1. 复用 agent 的问题分析和 query bundles。
+2. 全量 hybrid recall。
+3. 按 chunk 去重并按本地分数取前 500 chunks。
+4. 用 `qwen3-rerank` 做 chunk 级重排。
+5. 取最多 100 个完整 chunks 进入上下文，受 `RESEARCH_CONTEXT_TOKEN_BUDGET` 限制。
+6. 聊天模型只基于这些 chunks 生成研究报告。
+7. 正文引用会被归一化到最终参考文献编号，避免出现没有参考文献对应的 `[82]` 这类悬空编号。
+
+深度研究不做逐篇 judge，它更适合“综述类、比较类、研究方向类”的问题。
+
+## 项目结构
+
+```text
+agentic_rag/
+├── builder/
+│   ├── chunker.py      # Markdown 清洗与语义切块
+│   ├── embedder.py     # DashScope embedding
+│   ├── artifacts.py    # chunk 预览导出
+│   └── store.py        # SQLite + FTS5 + 向量存储
+├── query/
+│   ├── retriever.py    # hybrid search
+│   ├── reranker.py     # DashScope qwen3-rerank
+│   └── agent.py        # 问题分析、judge、深度研究生成、引用合并
+├── core/
+│   ├── config.py       # 环境变量和默认设置
+│   ├── llm.py          # OpenAI-compatible chat client
+│   ├── models.py       # Pydantic 数据模型
+│   └── utils.py        # retry、JSON 提取、归一化等工具
+└── cli.py              # Typer 命令行入口
+```
+
+## 本地数据与 Git
+
+以下内容不应该提交到 GitHub：
+
+- `.env`
+- `.rag_store/`
+- `literature_md/`
+- `literature_md_*/`
+- `.pytest_cache/`
+- `__pycache__/`
+- `dist/`
+- `build/`
+
+GitHub 仓库只应该保存源码、测试、README、示例配置和项目元数据。文献语料和向量库应由用户在本地通过 `literature-rag build` 或 `literature-rag add` 生成。
+
+## 测试
+
+```bash
+python -m pytest -q
+```
+
+当前开发环境也可以使用：
+
+```bash
+/home/fanny/miniconda3/envs/literature_rag/bin/python -m pytest -q
+```
+
+## 常见问题
+
+### 为什么别人从 GitHub 下载后没有 `literature-rag` 命令？
+
+`literature-rag` 是通过 `pyproject.toml` 的 console script 安装出来的，不应该直接提交 conda 环境里的可执行文件。别人 clone 后执行：
+
+```bash
+pip install -e .
+```
+
+就会在自己的 Python 环境中生成 `literature-rag` 命令。
+
+### `.rag_store/chunks/` 为什么不等于真实数据库？
+
+`.rag_store/chunks/` 是人工检查用的 chunk 预览。真实检索只读取 SQLite 数据库：
+
+```text
+.rag_store/literature_rag.sqlite3
+```
+
+### 深度研究为什么可能很慢？
+
+深度研究会全量召回、对最多 500 个 chunks 做 rerank，并把最多 100 个完整 chunks 交给聊天模型生成报告。它没有逐篇 judge，但上下文更大，速度主要受 rerank 和聊天模型服务影响。
+
+### 没有合法 H1 标题的 Markdown 会怎样？
+
+程序会跳过该文件并在 `failed_files` 中报告原因。当前设计坚持“标题必须来自 Markdown H1”，不会用文件名或 `Title:` 行兜底。

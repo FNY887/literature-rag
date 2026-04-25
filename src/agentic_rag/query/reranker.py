@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import http.client
 import json
 import socket
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from typing import Any
 
 from agentic_rag.core.config import Settings
 from agentic_rag.core.utils import is_retryable
 
 
 def _rerank_retryable(exc: Exception) -> bool:
+    if isinstance(exc, (http.client.RemoteDisconnected, http.client.HTTPException)):
+        return True
+    if isinstance(exc, (ConnectionError, ConnectionResetError, ConnectionAbortedError)):
+        return True
     if isinstance(exc, urllib.error.HTTPError):
         if exc.code in {408, 409, 429}:
             return True
@@ -21,6 +28,45 @@ def _rerank_retryable(exc: Exception) -> bool:
     if isinstance(exc, TimeoutError | socket.timeout):
         return True
     return is_retryable(exc)
+
+
+def _response_excerpt(raw_body: str, *, limit: int = 600) -> str:
+    compact = " ".join(raw_body.split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 3].rstrip() + "..."
+
+
+def _raise_api_error_if_present(body: dict[str, Any], raw_body: str) -> None:
+    error = body.get("error")
+    if isinstance(error, dict):
+        code = str(error.get("code", "")).strip()
+        message = str(error.get("message", "")).strip()
+        if code or message:
+            raise RuntimeError(f"{code}: {message}".strip(": "))
+        raise RuntimeError(f"Rerank API error: {_response_excerpt(raw_body)}")
+
+
+def _extract_results(body: dict[str, Any], raw_body: str) -> list[Any]:
+    output = body.get("output")
+    if isinstance(output, dict):
+        raw_results = output.get("results")
+        if isinstance(raw_results, list):
+            return raw_results
+
+    raw_results = body.get("results")
+    if isinstance(raw_results, list):
+        return raw_results
+
+    raw_results = body.get("data")
+    if isinstance(raw_results, list):
+        return raw_results
+
+    code = str(body.get("code", "")).strip()
+    message = str(body.get("message", "")).strip()
+    if code or message:
+        raise RuntimeError(f"{code}: {message}".strip(": "))
+    raise ValueError(f"Missing output/results in rerank response: {_response_excerpt(raw_body)}")
 
 
 @dataclass(slots=True)
@@ -71,22 +117,14 @@ class DashScopeRerankClient:
                 body = json.loads(raw_body)
                 if not isinstance(body, dict):
                     raise ValueError("Unexpected rerank response payload.")
-                output = body.get("output")
-                if not isinstance(output, dict):
-                    code = str(body.get("code", "")).strip()
-                    message = str(body.get("message", "")).strip()
-                    if code or message:
-                        raise RuntimeError(f"{code}: {message}".strip(": "))
-                    raise ValueError("Missing output in rerank response.")
-                raw_results = output.get("results")
-                if not isinstance(raw_results, list):
-                    raise ValueError("Missing results in rerank response.")
+                _raise_api_error_if_present(body, raw_body)
+                raw_results = _extract_results(body, raw_body)
                 parsed: list[tuple[int, float]] = []
                 for item in raw_results:
                     if not isinstance(item, dict):
                         continue
                     index = item.get("index")
-                    score = item.get("relevance_score")
+                    score = item.get("relevance_score", item.get("score"))
                     if not isinstance(index, int):
                         continue
                     try:
@@ -100,7 +138,6 @@ class DashScopeRerankClient:
                 last_exc = exc
                 if attempt == max(1, self.settings.rerank_max_retries) or not _rerank_retryable(exc):
                     break
-                import time
                 from agentic_rag.core.utils import retry_delay_seconds
 
                 time.sleep(

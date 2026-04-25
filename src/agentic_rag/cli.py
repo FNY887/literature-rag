@@ -3,25 +3,36 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import shutil
 import sys
 import threading
 import time
 from pathlib import Path
 
 import typer
+import questionary
 
 from agentic_rag.builder import add_documents, build_index, delete_document
 from agentic_rag.core.config import get_settings
-from agentic_rag.core.models import AgentAnswer
-from agentic_rag.query import answer_stream, warm_index
+from agentic_rag.core.models import AgentAnswer, ResearchAnswer
+from agentic_rag.query import answer_stream, research, warm_index
 from agentic_rag.query.agent import AgentStageError
 
 CLI_HELP_TEXT = (
-    "literature-rag: 进入提问模式，检索并回答文献问题。\n"
+    "literature-rag: 加载向量库后选择“文献检索”或“深度研究”。\n"
     "literature-rag build <dir>: 清空旧库，并用目录中的 Markdown 文献重建向量库。\n"
     "literature-rag add <dir>: 将目录中的 Markdown 文献递归加入现有向量库。\n"
     "literature-rag delete --title \"论文标题或md文件名\": 从向量库删除一篇文献。"
 )
+
+MODE_LITERATURE_SEARCH = "文献检索"
+MODE_DEEP_RESEARCH = "深度研究"
+MODE_SELECT_STYLE = questionary.Style([
+    ("pointer", "noinherit nobold noreverse"),
+    ("highlighted", "noinherit nobold noreverse"),
+    ("selected", "noinherit nobold noreverse"),
+    ("text", "noinherit nobold noreverse"),
+])
 
 app = typer.Typer(
     add_completion=False,
@@ -51,7 +62,8 @@ def _spinning_indicator(stop_event: threading.Event, message: str = "正在检�
         sys.stdout.write(f"\r{next(spinner)} {message}...")
         sys.stdout.flush()
         time.sleep(0.1)
-    sys.stdout.write("\r" + " " * (len(message) + 6) + "\r")
+    clear_width = max(80, shutil.get_terminal_size((80, 20)).columns)
+    sys.stdout.write("\r" + " " * clear_width + "\r")
     sys.stdout.flush()
 
 
@@ -62,6 +74,10 @@ async def _run_answer_stream(question: str, index_path: str):
             result = event.answer
             break
     return result
+
+
+async def _run_research(question: str, index_path: str) -> ResearchAnswer:
+    return await research(question=question, index_path=index_path)
 
 
 def _print_timing_summary(result: AgentAnswer) -> None:
@@ -80,6 +96,33 @@ def _print_timing_summary(result: AgentAnswer) -> None:
         f"provider pressure {result.performance_counters.provider_pressure_events} 次"
     )
     typer.echo()
+
+
+def _print_research_timing_summary(result: ResearchAnswer) -> None:
+    typer.echo("深度研究统计：")
+    typer.echo(f"- recalled chunks: {result.chunks_recalled}")
+    typer.echo(f"- reranked chunks: {result.chunks_reranked}")
+    typer.echo(f"- context chunks: {result.chunks_in_context}")
+    typer.echo()
+    typer.echo("耗时摘要：")
+    typer.echo(f"- analyze: {result.stage_timings.analyze_seconds:.2f}s")
+    typer.echo(f"- retrieve: {result.stage_timings.retrieve_seconds:.2f}s")
+    typer.echo(f"- rerank: {result.stage_timings.rerank_seconds:.2f}s")
+    typer.echo(f"- generate: {result.stage_timings.generate_seconds:.2f}s")
+    typer.echo(f"- total: {result.stage_timings.total_seconds:.2f}s")
+    typer.echo()
+
+
+def _select_interactive_mode() -> str:
+    choice = questionary.select(
+        "请选择运行模式：",
+        choices=[MODE_LITERATURE_SEARCH, MODE_DEEP_RESEARCH],
+        default=MODE_LITERATURE_SEARCH,
+        style=MODE_SELECT_STYLE,
+    ).ask()
+    if choice is None:
+        raise typer.Exit()
+    return str(choice)
 
 
 def _print_simple_help() -> None:
@@ -148,6 +191,44 @@ def main(
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
     _print_warmup_summary(warmup_stats)
+    mode = _select_interactive_mode()
+
+    if mode == MODE_DEEP_RESEARCH:
+        while True:
+            try:
+                question = typer.prompt(
+                    "请输入深度研究问题（直接回车退出）",
+                    default="",
+                    show_default=False,
+                )
+            except (typer.Abort, EOFError, KeyboardInterrupt):
+                break
+
+            question = question.strip()
+            if not question:
+                break
+
+            try:
+                result = _run_with_spinner(
+                    "正在深度研究",
+                    lambda: asyncio.run(_run_research(question=question, index_path=index_path)),
+                )
+            except AgentStageError as exc:
+                _print_agent_error(exc)
+                continue
+
+            typer.echo("研究报告：")
+            typer.echo(result.report)
+            typer.echo()
+
+            if result.citations:
+                typer.echo("参考文献：")
+                for citation in result.citations:
+                    typer.echo(citation)
+                typer.echo()
+
+            _print_research_timing_summary(result)
+        return
 
     while True:
         try:

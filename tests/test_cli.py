@@ -6,7 +6,7 @@ from typer.testing import CliRunner
 
 from agentic_rag.cli import app
 from agentic_rag.core.config import get_settings
-from agentic_rag.core.models import AgentAnswer, PerformanceCounters, StageTimings
+from agentic_rag.core.models import AgentAnswer, PerformanceCounters, ResearchAnswer, ResearchStageTimings, StageTimings
 
 runner = CliRunner()
 
@@ -23,7 +23,7 @@ def test_cli_help_renders():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
     assert result.stdout.strip().splitlines() == [
-        "literature-rag: 进入提问模式，检索并回答文献问题。",
+        "literature-rag: 加载向量库后选择“文献检索”或“深度研究”。",
         "literature-rag build <dir>: 清空旧库，并用目录中的 Markdown 文献重建向量库。",
         "literature-rag add <dir>: 将目录中的 Markdown 文献递归加入现有向量库。",
         "literature-rag delete --title \"论文标题或md文件名\": 从向量库删除一篇文献。",
@@ -263,6 +263,7 @@ def test_interactive_query_prints_timing_summary(monkeypatch):
         )
 
     monkeypatch.setattr("agentic_rag.cli.warm_index", fake_warm_index)
+    monkeypatch.setattr("agentic_rag.cli._select_interactive_mode", lambda: "文献检索")
     monkeypatch.setattr("agentic_rag.cli._run_answer_stream", fake_run_answer_stream)
     monkeypatch.setattr("agentic_rag.cli._spinning_indicator", lambda stop_event, message='正在检索': None)
 
@@ -279,3 +280,50 @@ def test_interactive_query_prints_timing_summary(monkeypatch):
     assert "- analyze: 0.10s" in result.stdout
     assert "- synthesize:" not in result.stdout
     assert "Judge统计：候选 1 篇；并发 5 -> 1；provider pressure 1 次" in result.stdout
+
+
+def test_interactive_research_prints_report(monkeypatch):
+    warmup_calls: list[str] = []
+
+    def fake_warm_index(*, index_path: str):
+        warmup_calls.append(index_path)
+        return SimpleNamespace(chunks_loaded=2, vector_dimensions=2)
+
+    async def fake_run_research(question: str, index_path: str):
+        assert question == "Research question?"
+        assert index_path == "dummy.sqlite3"
+        return ResearchAnswer(
+            report="这是一份研究报告[1]",
+            citations=["[1] Paper One (p. 1, chunk demo:0001)"],
+            used_queries=["test"],
+            chunks_recalled=20,
+            chunks_reranked=20,
+            chunks_in_context=10,
+            stage_timings=ResearchStageTimings(
+                analyze_seconds=0.1,
+                retrieve_seconds=0.2,
+                rerank_seconds=0.3,
+                generate_seconds=0.4,
+                total_seconds=1.0,
+            ),
+        )
+
+    monkeypatch.setattr("agentic_rag.cli.warm_index", fake_warm_index)
+    monkeypatch.setattr("agentic_rag.cli._select_interactive_mode", lambda: "深度研究")
+    monkeypatch.setattr("agentic_rag.cli._run_research", fake_run_research)
+    monkeypatch.setattr("agentic_rag.cli._spinning_indicator", lambda stop_event, message='正在检索': None)
+
+    result = runner.invoke(
+        app,
+        ["--index-path", "dummy.sqlite3"],
+        input="Research question?\n\n",
+    )
+
+    assert result.exit_code == 0
+    assert warmup_calls == ["dummy.sqlite3"]
+    assert "研究报告：" in result.stdout
+    assert "这是一份研究报告[1]" in result.stdout
+    assert "参考文献：" in result.stdout
+    assert "深度研究统计：" in result.stdout
+    assert "- context chunks: 10" in result.stdout
+    assert "- generate: 0.40s" in result.stdout

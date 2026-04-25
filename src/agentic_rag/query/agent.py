@@ -8,7 +8,7 @@ from time import perf_counter
 from typing import Any, AsyncIterator
 
 from agentic_rag.core.config import Settings
-from agentic_rag.core.llm import DeepSeekChatClient
+from agentic_rag.core.llm import LLMClient
 from agentic_rag.core.models import (
     AgentAnswer,
     AnswerStreamEvent,
@@ -17,6 +17,8 @@ from agentic_rag.core.models import (
     PerformanceCounters,
     QueryAnalysis,
     QueryBundle,
+    ResearchAnswer,
+    ResearchStageTimings,
     SearchHit,
     StageTimings,
 )
@@ -92,6 +94,32 @@ Return JSON only with these fields:
 - missing_constraints
 - reason
 - answer_line
+"""
+
+RESEARCH_REPORT_SYSTEM_PROMPT = """You are a scientific literature research report writer.
+You are given a user question and ranked evidence chunks.
+
+Rules:
+1. Use ONLY the provided chunks. Do not use outside knowledge.
+2. Write in the same language as the user's question.
+3. Respect the requested character range. For Chinese, one Chinese character counts as one character.
+4. Cite evidence inline using the provided reference ids like [1], [2].
+5. You do not need to use every chunk; use the best chunks that answer the question.
+6. Do not force a fixed structure. Write naturally; use paragraphs or bullets only when they fit the evidence and question.
+7. Do not cite reference ids that are not present in the provided chunks.
+8. If the chunks are insufficient, state the limitation clearly and cite the closest evidence.
+
+Return JSON only with these fields:
+- report: the research report text
+- used_ref_ids: list of numeric reference ids cited or used
+"""
+
+RESEARCH_REPORT_REPAIR_SYSTEM_PROMPT = """You revise a chunk-grounded research report to satisfy a length requirement.
+Keep the same language, preserve the important claims and inline citations, and do not add evidence outside the provided chunks.
+
+Return JSON only with these fields:
+- report
+- used_ref_ids
 """
 
 NO_DIRECT_SUPPORT_ANSWER = "现有检索到的文献片段中，没有找到直接支持该问题的文献内容。"
@@ -483,6 +511,35 @@ def _build_rerank_batches(
     return batches
 
 
+def _research_rerank_diagnostics(
+    *,
+    hits: list[SearchHit],
+    settings: Settings,
+    question: str,
+    query_analysis: QueryAnalysis,
+) -> dict[str, Any]:
+    rerank_limit = min(len(hits), max(1, settings.research_rerank_chunk_limit))
+    if rerank_limit <= 0:
+        return {
+            "rerank_documents": 0,
+            "rerank_batches": 0,
+            "rerank_request_token_budget": settings.rerank_request_token_budget,
+        }
+    rerank_query = query_analysis.target_claim.strip() or question
+    documents = [_research_rerank_input(hit) for hit in hits[:rerank_limit]]
+    batches = _build_rerank_batches(
+        documents=documents,
+        query=rerank_query,
+        instruct=settings.rerank_instruct,
+        token_budget=settings.rerank_request_token_budget,
+    )
+    return {
+        "rerank_documents": rerank_limit,
+        "rerank_batches": len(batches),
+        "rerank_request_token_budget": settings.rerank_request_token_budget,
+    }
+
+
 def _should_stop_early(*, consecutive_non_support_count: int) -> bool:
     return consecutive_non_support_count >= EARLY_STOP_CONSECUTIVE_NON_SUPPORT
 
@@ -674,6 +731,172 @@ def _numbered_citations(citations: list[str]) -> list[str]:
     return [f"[{i + 1}] {citation}" for i, citation in enumerate(citations)]
 
 
+def _research_hit_payload(hit: SearchHit, *, ref_id: int) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ref_id": ref_id,
+        "chunk_id": hit.chunk_id,
+        "title": hit.title,
+        "citation": hit.citation,
+        "score_final": hit.score_final,
+        "retrieval_source": hit.retrieval_source,
+        "text": hit.text,
+    }
+    if hit.section_hint:
+        payload["section_hint"] = hit.section_hint
+    if hit.matched_constraints:
+        payload["matched_constraints"] = hit.matched_constraints
+    return payload
+
+
+def _research_rerank_input(hit: SearchHit) -> str:
+    parts = [f"Title: {hit.title}", f"Chunk: {hit.chunk_id}"]
+    if hit.section_hint:
+        parts.append(f"Section: {hit.section_hint}")
+    parts.append(f"Evidence: {hit.text}")
+    return "\n".join(parts).strip()
+
+
+def _extract_report_ref_ids(report: str) -> list[int]:
+    ids: list[int] = []
+    seen: set[int] = set()
+    for bracket_content in re.findall(r"\[([\d,\s]+)\]", report):
+        for match in re.findall(r"\d+", bracket_content):
+            ref_id = int(match)
+            if ref_id in seen:
+                continue
+            seen.add(ref_id)
+            ids.append(ref_id)
+    return ids
+
+
+def _coerce_ref_ids(value: Any, *, max_ref_id: int) -> list[int]:
+    raw_values: list[Any]
+    if value is None:
+        raw_values = []
+    elif isinstance(value, list):
+        raw_values = value
+    else:
+        raw_values = [value]
+
+    ref_ids: list[int] = []
+    seen: set[int] = set()
+    for item in raw_values:
+        try:
+            ref_id = int(str(item).strip().strip("[]"))
+        except (TypeError, ValueError):
+            continue
+        if ref_id < 1 or ref_id > max_ref_id or ref_id in seen:
+            continue
+        seen.add(ref_id)
+        ref_ids.append(ref_id)
+    return ref_ids
+
+
+def _normalize_research_report_payload(
+    payload: dict[str, Any],
+    *,
+    max_ref_id: int,
+) -> tuple[str, list[int]]:
+    report = str(payload.get("report", "")).strip()
+    if not report:
+        raise ValueError("Missing report in research response.")
+    used_ref_ids = _coerce_ref_ids(payload.get("used_ref_ids"), max_ref_id=max_ref_id)
+    report_ref_ids = _extract_report_ref_ids(report)
+    merged: list[int] = []
+    seen: set[int] = set()
+    for ref_id in report_ref_ids + used_ref_ids:
+        if 1 <= ref_id <= max_ref_id and ref_id not in seen:
+            seen.add(ref_id)
+            merged.append(ref_id)
+    return report, merged
+
+
+def _research_report_length_status(report: str, *, min_chars: int) -> str | None:
+    report_length = len(report)
+    if min_chars > 0 and report_length < min_chars:
+        return "short"
+    return None
+
+
+def _extract_final_citation_ids(report: str) -> list[int]:
+    return _extract_report_ref_ids(report)
+
+
+def _validate_final_research_citations(report: str, citations: list[str]) -> None:
+    citation_count = len(citations)
+    invalid_ids = [
+        ref_id
+        for ref_id in _extract_final_citation_ids(report)
+        if ref_id < 1 or ref_id > citation_count
+    ]
+    if invalid_ids:
+        invalid_text = ", ".join(str(ref_id) for ref_id in sorted(set(invalid_ids)))
+        raise AgentStageError(
+            stage="research_generate",
+            message=f"Research report contains dangling citation id(s): {invalid_text}.",
+            question="",
+        )
+
+
+def _collapse_repeated_citation_runs(text: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        ids = re.findall(r"\[(\d+)\]", match.group(0))
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for ref_id in ids:
+            if ref_id in seen:
+                continue
+            seen.add(ref_id)
+            deduped.append(ref_id)
+        return "".join(f"[{ref_id}]" for ref_id in deduped)
+
+    return re.sub(r"(?:\[\d+\]\s*){2,}", _replace, text)
+
+
+def _merge_research_report_citations(
+    report: str,
+    ref_ids: list[int],
+    context_hits: list[SearchHit],
+) -> tuple[str, list[str]]:
+    ref_id_to_citation_id: dict[int, int] = {}
+    hits_by_doc: dict[str, list[SearchHit]] = {}
+    seen_chunks_by_doc: dict[str, set[str]] = {}
+
+    for ref_id in ref_ids:
+        if ref_id < 1 or ref_id > len(context_hits):
+            continue
+        hit = context_hits[ref_id - 1]
+        doc_key = _document_key_from_hit(hit)
+        if doc_key not in hits_by_doc:
+            hits_by_doc[doc_key] = []
+            seen_chunks_by_doc[doc_key] = set()
+        ref_id_to_citation_id[ref_id] = list(hits_by_doc).index(doc_key) + 1
+        if hit.chunk_id not in seen_chunks_by_doc[doc_key]:
+            hits_by_doc[doc_key].append(hit)
+            seen_chunks_by_doc[doc_key].add(hit.chunk_id)
+
+    def _replace_ref_group(match: re.Match[str]) -> str:
+        citation_ids: list[int] = []
+        seen_citation_ids: set[int] = set()
+        for raw_ref_id in re.findall(r"\d+", match.group(1)):
+            citation_id = ref_id_to_citation_id.get(int(raw_ref_id))
+            if citation_id is None or citation_id in seen_citation_ids:
+                continue
+            seen_citation_ids.add(citation_id)
+            citation_ids.append(citation_id)
+        return "".join(f"[{citation_id}]" for citation_id in citation_ids)
+
+    rewritten_report = re.sub(r"\[([\d,\s]+)\]", _replace_ref_group, report)
+    rewritten_report = _collapse_repeated_citation_runs(rewritten_report)
+    citations = [
+        f"[{index}] {_build_merged_citation(hits)}"
+        for index, hits in enumerate(hits_by_doc.values(), start=1)
+        if hits
+    ]
+    _validate_final_research_citations(rewritten_report, citations)
+    return rewritten_report, citations
+
+
 class AgentStageError(RuntimeError):
     def __init__(
         self,
@@ -683,6 +906,7 @@ class AgentStageError(RuntimeError):
         question: str,
         query_analysis: QueryAnalysis | None = None,
         raw_response: str | None = None,
+        extra_diagnostics: dict[str, Any] | None = None,
     ):
         super().__init__(message)
         self.stage = stage
@@ -690,6 +914,7 @@ class AgentStageError(RuntimeError):
         self.question = question
         self.query_analysis = query_analysis
         self.raw_response = raw_response
+        self.extra_diagnostics = extra_diagnostics or {}
 
     def diagnostic_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -703,14 +928,15 @@ class AgentStageError(RuntimeError):
         raw_response = _excerpt(self.raw_response)
         if raw_response is not None:
             payload["raw_response_excerpt"] = raw_response
+        payload.update(self.extra_diagnostics)
         return payload
 
 
-class DeepSeekRequiredError(AgentStageError):
+class ChatModelRequiredError(AgentStageError):
     def __init__(self, *, question: str):
         super().__init__(
             stage="setup",
-            message="DEEPSEEK_API_KEY is required for ask/chat agent reasoning.",
+            message="CHAT_API_KEY is required for ask/chat agent reasoning.",
             question=question,
         )
 
@@ -730,6 +956,7 @@ def _make_stage_error(
     question: str,
     exc: Exception,
     query_analysis: QueryAnalysis | None = None,
+    extra_diagnostics: dict[str, Any] | None = None,
 ) -> AgentStageError:
     message = str(exc).strip() or f"{stage} failed."
     return AgentStageError(
@@ -738,6 +965,7 @@ def _make_stage_error(
         question=question,
         query_analysis=query_analysis,
         raw_response=_exception_raw_response(exc),
+        extra_diagnostics=extra_diagnostics,
     )
 
 
@@ -749,7 +977,7 @@ def _is_timeout_error(exc: Exception) -> bool:
 class AgenticAnswerer:
     retriever: Any
     settings: Settings
-    llm_client: DeepSeekChatClient | None = None
+    llm_client: LLMClient | None = None
     rerank_client: Any | None = None
 
     def _hydrate_hits(self, hits: list[Any]) -> list[SearchHit]:
@@ -763,7 +991,7 @@ class AgenticAnswerer:
 
     async def analyze(self, question: str) -> QueryAnalysis:
         if self.llm_client is None:
-            raise DeepSeekRequiredError(question=question)
+            raise ChatModelRequiredError(question=question)
         try:
             payload = await self.llm_client.complete_json(
                 ANALYZE_SYSTEM_PROMPT,
@@ -791,7 +1019,7 @@ class AgenticAnswerer:
         document_candidate: DocumentCandidate,
     ) -> DocumentAssessment:
         if self.llm_client is None:
-            raise DeepSeekRequiredError(question=question)
+            raise ChatModelRequiredError(question=question)
         prompt = (
             "Question:\n"
             f"{question}\n\n"
@@ -827,6 +1055,287 @@ class AgenticAnswerer:
             exc=last_exc,
             query_analysis=query_analysis,
         ) from last_exc
+
+    def _recall_research_hits(
+        self,
+        *,
+        question: str,
+        query_analysis: QueryAnalysis,
+        search_fn,
+    ) -> tuple[list[SearchHit], list[str]]:
+        del question
+        used_queries: list[str] = []
+        used_query_keys: set[str] = set()
+        best_hits: dict[str, Any] = {}
+        recall_limit = max(1, self.settings.research_rerank_chunk_limit)
+        top_k_vector = max(query_analysis.top_k_vector or self.settings.top_k_vector, recall_limit)
+        top_k_keyword = max(query_analysis.top_k_keyword or self.settings.top_k_keyword, recall_limit)
+
+        for bundle in list(query_analysis.query_bundles):
+            bundle_key = _query_dedup_key(bundle.query)
+            if bundle_key in used_query_keys:
+                continue
+            used_query_keys.add(bundle_key)
+            used_queries.append(bundle.query)
+
+            keyword_fts_query = None
+            if bundle.keyword_phrases:
+                keyword_fts_query = build_fts_query_from_phrases(bundle.keyword_phrases)
+
+            round_hits = search_fn(
+                query=bundle.query,
+                mode="hybrid",
+                top_k_vector=top_k_vector,
+                top_k_keyword=top_k_keyword,
+                keyword_fts_query=keyword_fts_query,
+            )
+            if keyword_fts_query is not None:
+                round_hits.extend(
+                    search_fn(
+                        query=bundle.query,
+                        mode="hybrid",
+                        top_k_vector=top_k_vector,
+                        top_k_keyword=top_k_keyword,
+                        keyword_fts_query=None,
+                    )
+                )
+
+            for hit in round_hits:
+                existing = best_hits.get(hit.chunk_id)
+                if existing is None or hit.score_final > existing.score_final:
+                    best_hits[hit.chunk_id] = hit
+
+        ranked_hits = rerank_hits_for_query_plan(
+            self._hydrate_hits(list(best_hits.values())),
+            query_analysis,
+        )
+        return ranked_hits, used_queries
+
+    def _rerank_research_hits(
+        self,
+        *,
+        question: str,
+        query_analysis: QueryAnalysis,
+        hits: list[SearchHit],
+    ) -> tuple[list[SearchHit], int]:
+        if not hits:
+            return [], 0
+        rerank_limit = min(len(hits), max(1, self.settings.research_rerank_chunk_limit))
+        prefix = [hit.model_copy(deep=True) for hit in hits[:rerank_limit]]
+        suffix = hits[rerank_limit:]
+        if self.rerank_client is None or len(prefix) <= 1:
+            return prefix + suffix, len(prefix)
+
+        rerank_query = query_analysis.target_claim.strip() or question
+        documents = [_research_rerank_input(hit) for hit in prefix]
+        rerank_batches = _build_rerank_batches(
+            documents=documents,
+            query=rerank_query,
+            instruct=self.settings.rerank_instruct,
+            token_budget=self.settings.rerank_request_token_budget,
+        )
+        score_by_index: dict[int, float] = {}
+        for batch in rerank_batches:
+            rerank_results = self.rerank_client.rerank(
+                query=rerank_query,
+                documents=batch.documents,
+                top_n=len(batch.documents),
+                instruct=self.settings.rerank_instruct,
+            )
+            for batch_index, score in rerank_results:
+                if 0 <= batch_index < len(batch.original_indices):
+                    score_by_index[batch.original_indices[batch_index]] = score
+
+        ranked_pairs = sorted(
+            enumerate(prefix),
+            key=lambda item: (
+                score_by_index.get(item[0], float("-inf")),
+                item[1].score_final,
+                item[1].score_constraint,
+            ),
+            reverse=True,
+        )
+        return [hit for _, hit in ranked_pairs] + suffix, len(prefix)
+
+    def _select_research_context_hits(self, hits: list[SearchHit]) -> list[SearchHit]:
+        max_chunks = max(1, self.settings.research_final_chunk_limit)
+        token_budget = max(1, self.settings.research_context_token_budget)
+        available_budget = max(1, token_budget - 2000)
+        selected: list[SearchHit] = []
+        used_tokens = 0
+        for ref_id, hit in enumerate(hits[:max_chunks], start=1):
+            payload_text = json.dumps(_research_hit_payload(hit, ref_id=ref_id), ensure_ascii=False)
+            hit_tokens = _estimate_rerank_tokens(payload_text) + 16
+            if selected and used_tokens + hit_tokens > available_budget:
+                break
+            if not selected and hit_tokens > available_budget:
+                break
+            selected.append(hit)
+            used_tokens += hit_tokens
+        return selected
+
+    async def _generate_research_report(
+        self,
+        *,
+        question: str,
+        query_analysis: QueryAnalysis,
+        context_hits: list[SearchHit],
+    ) -> tuple[str, list[int]]:
+        if self.llm_client is None:
+            raise ChatModelRequiredError(question=question)
+        if not context_hits:
+            raise AgentStageError(
+                stage="research_generate",
+                message="No chunks fit the research context token budget.",
+                question=question,
+                query_analysis=query_analysis,
+            )
+
+        configured_min_chars = max(0, self.settings.research_report_min_chars)
+        min_chars = configured_min_chars
+        if min_chars > 0:
+            length_instruction = (
+                f"Write a research report of at least {min_chars} characters. "
+                "There is no maximum length limit; decide the appropriate length based on the provided chunks. "
+                "If writing Chinese, one Chinese character counts as one character."
+            )
+        else:
+            length_instruction = (
+                "Write a research report. There is no maximum length limit; decide the appropriate length "
+                "based on the provided chunks."
+            )
+        evidence_chunks = [
+            _research_hit_payload(hit, ref_id=index)
+            for index, hit in enumerate(context_hits, start=1)
+        ]
+        prompt = (
+            "Question:\n"
+            f"{question}\n"
+            f"{length_instruction}\n\n"
+            "Evidence chunks:\n"
+            f"{json.dumps(evidence_chunks, ensure_ascii=False)}"
+        )
+
+        payload = await self.llm_client.complete_json(RESEARCH_REPORT_SYSTEM_PROMPT, prompt)
+        report, used_ref_ids = _normalize_research_report_payload(payload, max_ref_id=len(context_hits))
+        length_status = _research_report_length_status(report, min_chars=min_chars)
+        if length_status is None:
+            return report, used_ref_ids
+
+        repair_instruction = (
+            f"The report below is {len(report)} characters long, shorter than the required "
+            f"minimum of {min_chars} characters. Expand it using only the provided evidence chunks. "
+            "There is no maximum length limit."
+        )
+        repair_prompt = (
+            "Original question:\n"
+            f"{question}\n\n"
+            f"{repair_instruction}\n\n"
+            "Allowed reference ids:\n"
+            f"{list(range(1, len(context_hits) + 1))}\n\n"
+            "Evidence chunks:\n"
+            f"{json.dumps(evidence_chunks, ensure_ascii=False)}\n\n"
+            "Draft report:\n"
+            f"{report}\n\n"
+            "Original used_ref_ids:\n"
+            f"{used_ref_ids}"
+        )
+        repaired_payload = await self.llm_client.complete_json(
+            RESEARCH_REPORT_REPAIR_SYSTEM_PROMPT,
+            repair_prompt,
+        )
+        repaired_report, repaired_ref_ids = _normalize_research_report_payload(
+            repaired_payload,
+            max_ref_id=len(context_hits),
+        )
+        repaired_status = _research_report_length_status(repaired_report, min_chars=min_chars)
+        if repaired_status is not None:
+            raise AgentStageError(
+                stage="research_generate",
+                message=(
+                    f"Research report is {len(repaired_report)} characters after repair, "
+                    f"shorter than required minimum {min_chars}."
+                ),
+                question=question,
+                query_analysis=query_analysis,
+            )
+        return repaired_report, repaired_ref_ids
+
+    async def research(self, question: str, search_fn) -> ResearchAnswer:
+        if self.llm_client is None:
+            raise ChatModelRequiredError(question=question)
+
+        total_started_at = perf_counter()
+        analyze_started_at = perf_counter()
+        query_analysis = await self.analyze(question)
+        analyze_seconds = perf_counter() - analyze_started_at
+
+        retrieve_started_at = perf_counter()
+        recalled_hits, used_queries = self._recall_research_hits(
+            question=question,
+            query_analysis=query_analysis,
+            search_fn=search_fn,
+        )
+        retrieve_seconds = perf_counter() - retrieve_started_at
+
+        rerank_started_at = perf_counter()
+        try:
+            reranked_hits, chunks_reranked = self._rerank_research_hits(
+                question=question,
+                query_analysis=query_analysis,
+                hits=recalled_hits,
+            )
+        except Exception as exc:
+            raise _make_stage_error(
+                stage="research_rerank",
+                question=question,
+                exc=exc,
+                query_analysis=query_analysis,
+                extra_diagnostics=_research_rerank_diagnostics(
+                    hits=recalled_hits,
+                    settings=self.settings,
+                    question=question,
+                    query_analysis=query_analysis,
+                ),
+            ) from exc
+        rerank_seconds = perf_counter() - rerank_started_at
+
+        context_hits = self._select_research_context_hits(reranked_hits)
+        generate_started_at = perf_counter()
+        try:
+            report, used_ref_ids = await self._generate_research_report(
+                question=question,
+                query_analysis=query_analysis,
+                context_hits=context_hits,
+            )
+        except AgentStageError:
+            raise
+        except Exception as exc:
+            raise _make_stage_error(
+                stage="research_generate",
+                question=question,
+                exc=exc,
+                query_analysis=query_analysis,
+            ) from exc
+        generate_seconds = perf_counter() - generate_started_at
+        report, citations = _merge_research_report_citations(report, used_ref_ids, context_hits)
+
+        stage_timings = ResearchStageTimings(
+            analyze_seconds=analyze_seconds,
+            retrieve_seconds=retrieve_seconds,
+            rerank_seconds=rerank_seconds,
+            generate_seconds=generate_seconds,
+            total_seconds=perf_counter() - total_started_at,
+        )
+        return ResearchAnswer(
+            report=report,
+            citations=citations,
+            used_queries=used_queries,
+            chunks_recalled=len(recalled_hits),
+            chunks_reranked=chunks_reranked,
+            chunks_in_context=len(context_hits),
+            stage_timings=stage_timings,
+        )
 
     def _recall_document_candidates(
         self,
@@ -989,20 +1498,17 @@ class AgenticAnswerer:
             token_budget=self.settings.rerank_request_token_budget,
         )
 
-        try:
-            score_by_index: dict[int, float] = {}
-            for batch in rerank_batches:
-                rerank_results = self.rerank_client.rerank(
-                    query=rerank_query,
-                    documents=batch.documents,
-                    top_n=len(batch.documents),
-                    instruct=self.settings.rerank_instruct,
-                )
-                for batch_index, score in rerank_results:
-                    if 0 <= batch_index < len(batch.original_indices):
-                        score_by_index[batch.original_indices[batch_index]] = score
-        except Exception:
-            return document_candidates
+        score_by_index: dict[int, float] = {}
+        for batch in rerank_batches:
+            rerank_results = self.rerank_client.rerank(
+                query=rerank_query,
+                documents=batch.documents,
+                top_n=len(batch.documents),
+                instruct=self.settings.rerank_instruct,
+            )
+            for batch_index, score in rerank_results:
+                if 0 <= batch_index < len(batch.original_indices):
+                    score_by_index[batch.original_indices[batch_index]] = score
 
         ranked_pairs = sorted(
             enumerate(prefix),
@@ -1101,7 +1607,7 @@ class AgenticAnswerer:
 
     async def answer_stream(self, question: str, search_fn) -> AsyncIterator[AnswerStreamEvent]:
         if self.llm_client is None:
-            raise DeepSeekRequiredError(question=question)
+            raise ChatModelRequiredError(question=question)
 
         total_started_at = perf_counter()
         analyze_started_at = perf_counter()
@@ -1118,11 +1624,19 @@ class AgenticAnswerer:
             retrieve_seconds = perf_counter() - retrieve_started_at
 
             rerank_started_at = perf_counter()
-            document_candidates = self._rerank_document_candidates(
-                question=question,
-                query_analysis=query_analysis,
-                document_candidates=recalled_candidates,
-            )
+            try:
+                document_candidates = self._rerank_document_candidates(
+                    question=question,
+                    query_analysis=query_analysis,
+                    document_candidates=recalled_candidates,
+                )
+            except Exception as exc:
+                raise _make_stage_error(
+                    stage="rerank",
+                    question=question,
+                    exc=exc,
+                    query_analysis=query_analysis,
+                ) from exc
             rerank_seconds = perf_counter() - rerank_started_at
             judge_limit = max(1, self.settings.document_judge_limit)
             document_candidates = document_candidates[:judge_limit]

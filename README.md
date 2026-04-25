@@ -6,13 +6,17 @@ corpora. It splits the workflow into two independent modules:
 1. **Builder** (`agentic_rag.builder`): chunk Markdown files, generate embeddings,
    persist a hybrid index (SQLite + FTS5 + vectors), and export cleaned/chunked artifacts for inspection under `.rag_store/chunks/`.
 2. **Query** (`agentic_rag.query`): analyze questions, run hybrid retrieval,
-   grade evidence, write one answer line per direct-support paper, and assemble answers with citations.
+   either grade evidence per paper for literature search or synthesize a chunk-grounded research report.
 
 The design is not "one-shot vector retrieval then generate". Instead, an agent
 plans retrieval, scores **all** chunks without truncation, aggregates documents
 by the average of their top-3 chunk scores, re-ranks the top 300 documents,
 judges evidence per paper on the top 100, and stops early when no more
 direct-support papers are found.
+
+The optional deep research route keeps the same retrieval planner, re-ranks the
+top 500 chunks, sends up to 100 complete chunks within a context budget, and
+asks the chat model to write a cited research report of at least 500 characters, with no fixed upper limit.
 
 ## Installation
 
@@ -39,9 +43,13 @@ All API keys and tunables are read from environment variables.
 
 ### Agent reasoning
 
-- `DEEPSEEK_API_KEY`: required for ask agent reasoning
-- `DEEPSEEK_BASE_URL`: defaults to `https://api.deepseek.com`
-- `DEEPSEEK_MODEL`: defaults to `deepseek-chat`
+- `CHAT_API_KEY`: required for OpenAI-compatible ask agent reasoning
+- `CHAT_BASE_URL`: defaults to `https://api.deepseek.com`
+- `CHAT_MODEL`: defaults to `deepseek-chat`
+- Common compatible endpoints:
+  - DeepSeek: `CHAT_BASE_URL=https://api.deepseek.com`
+  - DashScope compatible mode: `CHAT_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1`
+  - OpenAI: `CHAT_BASE_URL=https://api.openai.com/v1`
 
 ### Chunking & retrieval
 
@@ -53,6 +61,10 @@ All API keys and tunables are read from environment variables.
 - `DOCUMENT_RECALL_LIMIT`: defaults to `300`
 - `DOCUMENT_JUDGE_LIMIT`: defaults to `100`
 - `DOCUMENT_JUDGE_INITIAL_CONCURRENCY`: defaults to `5`; provider pressure retries already-dispatched documents with lower concurrency
+- `RESEARCH_RERANK_CHUNK_LIMIT`: defaults to `500`
+- `RESEARCH_FINAL_CHUNK_LIMIT`: defaults to `100`
+- `RESEARCH_CONTEXT_TOKEN_BUDGET`: defaults to `120000`
+- `RESEARCH_REPORT_MIN_CHARS`: defaults to `500`; Python character count, so one Chinese character counts as one
 
 ## CLI
 
@@ -63,7 +75,7 @@ literature-rag build ./papers
 # Add new papers incrementally from a directory
 literature-rag add ./new_papers
 
-# Interactive query mode
+# Interactive mode selection: literature search or deep research
 literature-rag
 
 # Show command help
@@ -74,13 +86,18 @@ Default behavior:
 
 - `literature-rag build <dir>` clears the current vector database and rebuilds it from the Markdown files under `<dir>`.
 - `literature-rag add <dir>` keeps the existing vector database and adds new Markdown papers from `<dir>`.
-- `literature-rag` starts interactive question-answer mode on the default database path `.rag_store/literature_rag.sqlite3`.
+- `literature-rag` loads the default database path `.rag_store/literature_rag.sqlite3`, then shows an up/down-key menu for `文献检索` or `深度研究`.
 - `literature-rag --help` shows the available commands and usage.
 
-Interactive mode prompts for a question, runs the full agentic pipeline, and outputs:
+Literature search mode prompts for a question, runs the document-level agentic pipeline, and outputs:
 1. Numbered answer lines (one per paper)
 2. Numbered reference list (multi-chunk papers list all supporting chunks)
 3. Scan status summary
+
+Deep research mode prompts for a research question, runs chunk-level rerank, and outputs:
+1. A research report of at least `RESEARCH_REPORT_MIN_CHARS`, with length decided by the chat model from the provided chunks
+2. A reference list for cited chunks
+3. Recall/rerank/context chunk counts and timing summary
 
 ## Python API
 
@@ -107,7 +124,7 @@ add_documents(
 ```python
 import asyncio
 
-from agentic_rag.query import answer, answer_stream, search
+from agentic_rag.query import answer, answer_stream, research, search
 
 # Search
 hits = search(
@@ -129,6 +146,14 @@ async def main():
         print(event.event)
 
 asyncio.run(main())
+
+# Deep research report
+report = asyncio.run(
+    research(
+        question="summarize evidence for collagen intrafibrillar mineralization",
+    )
+)
+print(report.report)
 ```
 
 ## Architecture
@@ -146,7 +171,7 @@ agentic_rag/
 ├── core/             # Shared
 │   ├── models.py     # Pydantic data models
 │   ├── config.py     # Settings
-│   ├── llm.py        # LLM client (DeepSeek)
+│   ├── llm.py        # OpenAI-compatible chat LLM client
 │   └── utils.py      # Retry, dedupe, JSON extraction
 └── cli.py            # Typer CLI
 ```

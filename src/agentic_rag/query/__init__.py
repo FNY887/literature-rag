@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from pathlib import Path
 from typing import Any, AsyncIterator, Protocol
 
@@ -9,9 +10,9 @@ import numpy as np
 from agentic_rag.builder.embedder import DashScopeEmbeddingClient
 from agentic_rag.builder.store import SQLiteIndexStore
 from agentic_rag.core.config import Settings, get_settings
-from agentic_rag.core.llm import DeepSeekChatClient
-from agentic_rag.core.models import AgentAnswer, AnswerStreamEvent, SearchHit
-from agentic_rag.query.agent import AgentStageError, AgenticAnswerer, DashScopeRequiredError, DeepSeekRequiredError
+from agentic_rag.core.llm import LLMClient, OpenAICompatibleChatClient
+from agentic_rag.core.models import AgentAnswer, AnswerStreamEvent, ResearchAnswer, SearchHit
+from agentic_rag.query.agent import AgentStageError, AgenticAnswerer, ChatModelRequiredError, DashScopeRequiredError
 from agentic_rag.query.retriever import HybridRetriever
 from agentic_rag.query.reranker import DashScopeRerankClient
 
@@ -63,7 +64,7 @@ def _validate_default_retrieval_stack(
     if embedder is None:
         missing_requirements.append("query embeddings for hybrid retrieval")
     if reranker is None:
-        missing_requirements.append("qwen3-rerank document reranking")
+        missing_requirements.append("qwen3-rerank reranking")
     if missing_requirements:
         raise DashScopeRequiredError(
             question=question,
@@ -98,6 +99,22 @@ def _make_search_fn(
         )
 
     return search_fn
+
+
+async def _close_owned_llm_client(llm_client: LLMClient | None, *, owned: bool) -> None:
+    if not owned or llm_client is None:
+        return
+    close_method = getattr(llm_client, "close", None)
+    if callable(close_method):
+        result = close_method()
+        if inspect.isawaitable(result):
+            await result
+        return
+    aclose_method = getattr(llm_client, "aclose", None)
+    if callable(aclose_method):
+        result = aclose_method()
+        if inspect.isawaitable(result):
+            await result
 
 
 def warm_index(
@@ -168,7 +185,7 @@ async def answer(
     index_path: str | Path | None = None,
     settings: Settings | None = None,
     embedder: Embedder | None = None,
-    llm: DeepSeekChatClient | None = None,
+    llm: LLMClient | None = None,
     reranker: Reranker | None = None,
 ) -> AgentAnswer:
     resolved = _resolve_settings(settings, index_path=index_path)
@@ -185,10 +202,12 @@ async def answer(
     )
     embedding_client = embedder or DashScopeEmbeddingClient(resolved)
     llm_client = llm
-    if llm_client is None and resolved.deepseek_api_key:
-        llm_client = DeepSeekChatClient(resolved)
+    owns_llm_client = False
+    if llm_client is None and resolved.chat_api_key:
+        llm_client = OpenAICompatibleChatClient(resolved)
+        owns_llm_client = True
     if llm_client is None:
-        raise DeepSeekRequiredError(question=question)
+        raise ChatModelRequiredError(question=question)
     rerank_client = reranker
     if rerank_client is None and resolved.dashscope_api_key:
         rerank_client = DashScopeRerankClient(resolved)
@@ -199,7 +218,55 @@ async def answer(
         rerank_client=rerank_client,
     )
     search_fn = _make_search_fn(retriever, resolved, embedding_client)
-    return await answerer.answer(question=question, search_fn=search_fn)
+    try:
+        return await answerer.answer(question=question, search_fn=search_fn)
+    finally:
+        await _close_owned_llm_client(llm_client, owned=owns_llm_client)
+
+
+async def research(
+    *,
+    question: str,
+    index_path: str | Path | None = None,
+    settings: Settings | None = None,
+    embedder: Embedder | None = None,
+    llm: LLMClient | None = None,
+    reranker: Reranker | None = None,
+) -> ResearchAnswer:
+    resolved = _resolve_settings(settings, index_path=index_path)
+    store = SQLiteIndexStore(resolved.index_path)
+    retriever = HybridRetriever(
+        store=store,
+        settings=resolved,
+    )
+    _validate_default_retrieval_stack(
+        question=question,
+        settings=resolved,
+        embedder=embedder,
+        reranker=reranker,
+    )
+    embedding_client = embedder or DashScopeEmbeddingClient(resolved)
+    llm_client = llm
+    owns_llm_client = False
+    if llm_client is None and resolved.chat_api_key:
+        llm_client = OpenAICompatibleChatClient(resolved)
+        owns_llm_client = True
+    if llm_client is None:
+        raise ChatModelRequiredError(question=question)
+    rerank_client = reranker
+    if rerank_client is None and resolved.dashscope_api_key:
+        rerank_client = DashScopeRerankClient(resolved)
+    answerer = AgenticAnswerer(
+        retriever=retriever,
+        settings=resolved,
+        llm_client=llm_client,
+        rerank_client=rerank_client,
+    )
+    search_fn = _make_search_fn(retriever, resolved, embedding_client)
+    try:
+        return await answerer.research(question=question, search_fn=search_fn)
+    finally:
+        await _close_owned_llm_client(llm_client, owned=owns_llm_client)
 
 
 def answer_stream(
@@ -208,7 +275,7 @@ def answer_stream(
     index_path: str | Path | None = None,
     settings: Settings | None = None,
     embedder: Embedder | None = None,
-    llm: DeepSeekChatClient | None = None,
+    llm: LLMClient | None = None,
     reranker: Reranker | None = None,
 ) -> AsyncIterator[AnswerStreamEvent]:
     resolved = _resolve_settings(settings, index_path=index_path)
@@ -225,10 +292,12 @@ def answer_stream(
     )
     embedding_client = embedder or DashScopeEmbeddingClient(resolved)
     llm_client = llm
-    if llm_client is None and resolved.deepseek_api_key:
-        llm_client = DeepSeekChatClient(resolved)
+    owns_llm_client = False
+    if llm_client is None and resolved.chat_api_key:
+        llm_client = OpenAICompatibleChatClient(resolved)
+        owns_llm_client = True
     if llm_client is None:
-        raise DeepSeekRequiredError(question=question)
+        raise ChatModelRequiredError(question=question)
     rerank_client = reranker
     if rerank_client is None and resolved.dashscope_api_key:
         rerank_client = DashScopeRerankClient(resolved)
@@ -239,4 +308,12 @@ def answer_stream(
         rerank_client=rerank_client,
     )
     search_fn = _make_search_fn(retriever, resolved, embedding_client)
-    return answerer.answer_stream(question=question, search_fn=search_fn)
+
+    async def _stream() -> AsyncIterator[AnswerStreamEvent]:
+        try:
+            async for event in answerer.answer_stream(question=question, search_fn=search_fn):
+                yield event
+        finally:
+            await _close_owned_llm_client(llm_client, owned=owns_llm_client)
+
+    return _stream()

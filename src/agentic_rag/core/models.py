@@ -72,6 +72,14 @@ class StageTimings(BaseModel):
     total_seconds: float = 0.0
 
 
+class ResearchStageTimings(BaseModel):
+    analyze_seconds: float = 0.0
+    retrieve_seconds: float = 0.0
+    rerank_seconds: float = 0.0
+    generate_seconds: float = 0.0
+    total_seconds: float = 0.0
+
+
 class PerformanceCounters(BaseModel):
     judge_documents_total: int = 0
     judge_concurrency_initial: int = 1
@@ -93,6 +101,16 @@ class AgentAnswer(BaseModel):
     scan_status: str = ""
     stage_timings: StageTimings = Field(default_factory=StageTimings)
     performance_counters: PerformanceCounters = Field(default_factory=PerformanceCounters)
+
+
+class ResearchAnswer(BaseModel):
+    report: str
+    citations: list[str]
+    used_queries: list[str]
+    chunks_recalled: int
+    chunks_reranked: int
+    chunks_in_context: int
+    stage_timings: ResearchStageTimings = Field(default_factory=ResearchStageTimings)
 
 
 class AnswerStreamEvent(BaseModel):

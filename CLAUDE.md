@@ -9,7 +9,7 @@ A local agentic RAG system for scientific literature **Markdown corpora**.
 - **Input**: `.md` files (not JSON)
 - **Index**: SQLite + FTS5 + DashScope embeddings (2048-dim, text-embedding-v4)
 - **Retrieval**: Hybrid (vector + keyword), RRF fusion, qwen3-rerank. Agent mode returns **all chunks** (no truncation) so every document can be scored; document rerank uses top-3 chunks and token-budgeted batches.
-- **Reasoning**: DeepSeek (deepseek-chat) for query analysis and document judgment with answer-line writing
+- **Reasoning**: OpenAI-compatible chat model for query analysis, document judgment, and research report generation
 - **Answer lines**: direct-support answer lines are 2-3 sentence chunk-grounded explanations, not single generic claims.
 - **Design philosophy**: Build and query are physically separated modules. No chat session history. No complex JSON parsing.
 - **Document scoring**: documents are ranked by the **average of their top-3 chunk scores** after hybrid fusion, then reranked, then judged.
@@ -29,7 +29,7 @@ agentic_rag/
 ├── core/             # Shared
 │   ├── models.py     # Pydantic data models
 │   ├── config.py     # Settings (reads .env via python-dotenv)
-│   ├── llm.py        # LLMClient Protocol + DeepSeekChatClient
+│   ├── llm.py        # LLMClient Protocol + OpenAICompatibleChatClient
 │   └── utils.py      # Retry, dedupe, extract_json_block
 ├── cli.py            # Typer CLI: build, add, interactive ask
 └── __init__.py
@@ -38,9 +38,9 @@ agentic_rag/
 ## 3. Hard Rules
 
 ### API Keys
-- **NEVER** write API keys into source code, tests, README, or CLAUDE.md
-- Keys live in `.env` (gitignored). `config.py` auto-loads via `python-dotenv`
-- Current keys: DASHSCOPE_API_KEY, DEEPSEEK_API_KEY
+- **NEVER** write real API keys into source code, tests, README, or CLAUDE.md
+- The repository may track an empty `.env` template. Once real keys are filled in, do not commit local `.env` modifications.
+- Current keys: `DASHSCOPE_API_KEY` for embedding/rerank and `API_KEY` for the OpenAI-compatible chat model
 
 ### Input Format
 - Only `.md` Markdown files. No JSON parsing.
@@ -67,7 +67,7 @@ agentic_rag/
 | RERANK_DOCUMENT_CHUNK_LIMIT | 3 |
 | RERANK_DOCUMENT_TEXT_LIMIT | 0 |
 | RERANK_REQUEST_TOKEN_BUDGET | 3600 |
-| DEEPSEEK_MODEL | deepseek-chat |
+| MODEL | deepseek-chat |
 | CHUNK_SIZE | 2200 |
 | CHUNK_OVERLAP | 100 |
 | TOP_K_VECTOR / KEYWORD | 30 |

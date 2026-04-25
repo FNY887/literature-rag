@@ -1,7 +1,6 @@
-# Local secrets
-.env
+# Local secret overrides
 .env.*
-!.env.example
+!.env
 
 # Local vector stores and user corpora
 .rag_store/

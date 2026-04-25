@@ -14,7 +14,7 @@
 - 文献删除：可按论文标题或原始 Markdown 文件名从库里删除。
 - 文献检索模式：召回、rerank、逐篇 judge，并输出每篇支持文献的回答行和参考文献。
 - 深度研究模式：召回后做 chunk 级 rerank，取最多 100 个完整 chunks，让聊天模型生成带引用的研究报告。
-- 可替换聊天模型：通用聊天模型使用 OpenAI-compatible Chat Completions API，通过 `CHAT_*` 环境变量配置。
+- 可替换聊天模型：通用聊天模型使用兼容 OpenAI Chat Completions 的 API，通过 `API_KEY`、`BASE_URL`、`MODEL` 配置。
 
 ## 安装
 
@@ -40,22 +40,18 @@ literature-rag
 
 ## 配置
 
-复制示例配置：
+仓库中直接包含一个空 key 的 `.env` 模板。安装后打开 `.env`，填入自己的 key 即可。
 
-```bash
-cp .env.example .env
-```
-
-然后在 `.env` 中填写自己的 key。不要把 `.env` 提交到 Git。
+注意：`.env` 虽然作为模板提交到了仓库，但你填入真实 API key 后，不要把这次修改提交到 GitHub。
 
 ### 必填 key
 
 ```bash
 DASHSCOPE_API_KEY=
-CHAT_API_KEY=
+API_KEY=
 ```
 
-`DASHSCOPE_API_KEY` 用于 embedding 和 rerank。`CHAT_API_KEY` 用于 agent 分析、文献 judge 和深度研究报告生成。
+`DASHSCOPE_API_KEY` 用于 embedding 和 rerank。`API_KEY` 用于兼容 OpenAI API 的聊天模型，也就是 agent 分析、文献 judge 和深度研究报告生成。
 
 ### Embedding 与 rerank
 
@@ -73,26 +69,26 @@ RERANK_REQUEST_TOKEN_BUDGET=3600
 ### 通用聊天模型
 
 ```bash
-CHAT_BASE_URL=https://api.deepseek.com
-CHAT_MODEL=deepseek-chat
-CHAT_TIMEOUT_SECONDS=300
-CHAT_MAX_RETRIES=4
+BASE_URL=https://api.deepseek.com
+MODEL=deepseek-chat
+TIMEOUT_SECONDS=300
+MAX_RETRIES=4
 ```
 
-聊天模型走 OpenAI-compatible API，因此可以换成不同服务：
+聊天模型只要求服务兼容 OpenAI Chat Completions API，因此可以换成不同服务：
 
 ```bash
 # DeepSeek
-CHAT_BASE_URL=https://api.deepseek.com
-CHAT_MODEL=deepseek-chat
+BASE_URL=https://api.deepseek.com
+MODEL=deepseek-chat
 
 # DashScope OpenAI 兼容模式
-CHAT_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
-CHAT_MODEL=qwen-plus
+BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+MODEL=qwen-plus
 
 # OpenAI
-CHAT_BASE_URL=https://api.openai.com/v1
-CHAT_MODEL=gpt-4.1-mini
+BASE_URL=https://api.openai.com/v1
+MODEL=gpt-4.1-mini
 ```
 
 ### 切块与检索默认值
@@ -361,7 +357,7 @@ agentic_rag/
 
 以下内容不应该提交到 GitHub：
 
-- `.env`
+- 填入真实 API key 之后的 `.env` 修改
 - `.rag_store/`
 - `literature_md/`
 - `literature_md_*/`
@@ -370,7 +366,19 @@ agentic_rag/
 - `dist/`
 - `build/`
 
-GitHub 仓库只应该保存源码、测试、README、示例配置和项目元数据。文献语料和向量库应由用户在本地通过 `literature-rag build` 或 `literature-rag add` 生成。
+GitHub 仓库只应该保存源码、测试、README、空 key 的 `.env` 模板和项目元数据。文献语料和向量库应由用户在本地通过 `literature-rag build` 或 `literature-rag add` 生成。
+
+如果你已经在 `.env` 里填了真实 key，可以执行下面的命令让 Git 暂时忽略本机对 `.env` 的修改：
+
+```bash
+git update-index --skip-worktree .env
+```
+
+如果以后确实要更新 `.env` 模板，再恢复跟踪：
+
+```bash
+git update-index --no-skip-worktree .env
+```
 
 ## 测试
 

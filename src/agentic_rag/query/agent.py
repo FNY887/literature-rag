@@ -936,7 +936,7 @@ class ChatModelRequiredError(AgentStageError):
     def __init__(self, *, question: str):
         super().__init__(
             stage="setup",
-            message="CHAT_API_KEY is required for ask/chat agent reasoning.",
+            message="API_KEY is required for ask/chat agent reasoning.",
             question=question,
         )
 

@@ -391,7 +391,7 @@ def test_answer_requires_chat_model_when_no_chat_client(tmp_path: Path, monkeypa
     settings = get_settings()
     settings.dashscope_api_key = None
     settings.chat_api_key = None
-    monkeypatch.delenv("CHAT_API_KEY", raising=False)
+    monkeypatch.delenv("API_KEY", raising=False)
 
     build_index(source_dir=source_dir, index_path=index_path, settings=settings, embedder=embedder)
 

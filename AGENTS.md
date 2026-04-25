@@ -38,7 +38,7 @@
 /home/fanny/miniconda3/envs/literature_rag/bin/pip install -e .
 ```
 
-不要把 API key 写进代码或仓库。统一用环境变量（`.env` 文件，已 gitignore）。
+不要把真实 API key 写进代码或文档。仓库中允许提交空 key 的 `.env` 模板；一旦用户在 `.env` 中填入真实 key，就不要再提交该文件的本地修改。
 
 ## 3. 当前锁定默认值
 
@@ -47,8 +47,8 @@
 - `EMBEDDING_MODEL=text-embedding-v4`
 - `EMBEDDING_DIMENSIONS=2048`
 - `DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1`
-- `DEEPSEEK_BASE_URL=https://api.deepseek.com`
-- `DEEPSEEK_MODEL=deepseek-chat`
+- `BASE_URL=https://api.deepseek.com`
+- `MODEL=deepseek-chat`
 - `RERANK_MODEL=qwen3-rerank`
 - `RERANK_DOCUMENT_CHUNK_LIMIT=3`
 - `RERANK_DOCUMENT_TEXT_LIMIT=0`（默认不截断；正整数才启用兼容性截断）

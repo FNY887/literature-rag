@@ -71,7 +71,7 @@ class OpenAICompatibleChatClient:
 
     def __post_init__(self) -> None:
         if not self.settings.chat_api_key:
-            raise ValueError("CHAT_API_KEY is required for ask/chat agent reasoning.")
+            raise ValueError("API_KEY is required for ask/chat agent reasoning.")
         self._client = AsyncOpenAI(
             api_key=self.settings.chat_api_key,
             base_url=self.settings.chat_base_url,

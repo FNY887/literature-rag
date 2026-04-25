@@ -246,6 +246,8 @@ Python API 支持注入自定义后端：
 
 ## 输入 Markdown 格式
 
+本项目当前只直接读取 Markdown 文件，不直接解析 PDF。如果原始文献是 PDF，可以先使用 MinerU 的网页版或 App 将 PDF 解析、转换为 Markdown，再把生成的 `.md` 文件放入文献目录中执行 `literature-rag build` 或 `literature-rag add`。
+
 每篇文献应该是一个 `.md` 文件，并且必须有真实论文标题 H1：
 
 ```markdown
